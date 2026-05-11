@@ -1,72 +1,50 @@
 package com.example.demo;
 
-import org.h2.jdbcx.JdbcDataSource;
-import org.springframework.stereotype.Repository;
+import org.springframework.stereotype.Service;
 
-import javax.sql.XAConnection;
-import javax.transaction.xa.XAException;
-import java.sql.Connection;
-import java.sql.PreparedStatement;
+@Service
+public class DistributedTransactionService {
 
-@Repository
-public class UserXaDao {
+    private final UserXaDao userXaDao;
+    private final UserMongoDao userMongoDao;
+    private final XATransactionCoordinator coordinator;
 
-    private final XATransactionCoordinator txCoordinator;
-    private final UserMongoDao mongoDao;
-
-    public UserXaDao(
-            XATransactionCoordinator txCoordinator,
-            UserMongoDao mongoDao
+    public DistributedTransactionService(
+            UserXaDao userXaDao,
+            UserMongoDao userMongoDao,
+            XATransactionCoordinator coordinator
     ) {
 
-        this.txCoordinator = txCoordinator;
-        this.mongoDao = mongoDao;
+        this.userXaDao = userXaDao;
+        this.userMongoDao = userMongoDao;
+        this.coordinator = coordinator;
     }
 
     public void save(UserEntity user) {
 
-        XAConnection h2XaConn = null;
-
         try {
 
             // ─────────────────────────────
-            // BEGIN
+            // BEGIN GLOBAL TX
             // ─────────────────────────────
 
-            txCoordinator.begin();
+            coordinator.begin();
 
             // ─────────────────────────────
-            // H2 XA RESOURCE
+            // H2 XA
             // ─────────────────────────────
 
-            JdbcDataSource ds = new JdbcDataSource();
+            userXaDao.save(user);
 
-            ds.setURL("jdbc:h2:mem:testdb");
-            ds.setUser("sa");
-            ds.setPassword("password");
-
-            h2XaConn = ds.getXAConnection();
-
-            txCoordinator.enlist(h2XaConn);
-
-            Connection conn = h2XaConn.getConnection();
-
-            PreparedStatement ps =
-                    conn.prepareStatement(
-                            "INSERT INTO user_entity(name) VALUES(?)"
-                    );
-
-            ps.setString(1, user.getName());
-
-            ps.executeUpdate();
-
-            System.out.println("[APP] Usuário salvo no H2");
+            System.out.println(
+                    "[APP] Usuário salvo no H2 XA"
+            );
 
             // ─────────────────────────────
             // SIMULA FALHA
             // ─────────────────────────────
 
-            if(user.getName().equals("erro")) {
+            if ("erro".equalsIgnoreCase(user.getName())) {
 
                 throw new RuntimeException(
                         "Falha simulada Mongo"
@@ -77,54 +55,73 @@ public class UserXaDao {
             // MONGO
             // ─────────────────────────────
 
-            mongoDao.save(user);
+            userMongoDao.save(user);
 
-            System.out.println("[APP] Usuário salvo no Mongo");
+            System.out.println(
+                    "[APP] Usuário salvo no Mongo"
+            );
 
             // ─────────────────────────────
-            // END
+            // END XA
             // ─────────────────────────────
 
-            txCoordinator.delistAll();
+            coordinator.delistAll();
 
             // ─────────────────────────────
             // PREPARE
             // ─────────────────────────────
 
-            boolean ok = txCoordinator.prepare();
+            boolean ok = coordinator.prepare();
 
             // ─────────────────────────────
-            // COMMIT / ROLLBACK
+            // DECISÃO GLOBAL
             // ─────────────────────────────
 
-            if(ok) {
+            if (ok) {
 
-                txCoordinator.commit();
+                coordinator.commit();
+
+                System.out.println(
+                        "[APP] COMMIT GLOBAL"
+                );
 
             } else {
 
-                txCoordinator.rollback();
+                coordinator.rollback();
+
+                System.out.println(
+                        "[APP] ROLLBACK GLOBAL"
+                );
             }
 
         } catch (Exception ex) {
+
+            System.out.println(
+                    "[APP] ERRO -> rollback global"
+            );
 
             ex.printStackTrace();
 
             try {
 
-                txCoordinator.rollback();
+                coordinator.rollback();
 
-            } catch (Exception e) {
-
-                e.printStackTrace();
+            } catch (Exception ignored) {
             }
 
+            // ─────────────────────────────
             // SAGA COMPENSATÓRIA
+            // ─────────────────────────────
+
             try {
 
-                mongoDao.delete(user.getId());
+                if (user.getId() != null) {
 
-            } catch(Exception ignored){}
+                    userMongoDao.delete(user.getId());
+                }
+
+            } catch (Exception ignored) {
+            }
 
             throw new RuntimeException(ex);
         }
